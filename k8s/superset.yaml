@@ -1,0 +1,117 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: superset-config
+data:
+  superset_config.py: |
+    import os
+
+    SQLALCHEMY_DATABASE_URI = 'postgresql://superset:superset@db/superset'
+
+    if os.environ["ALLOW_IFRAME"] == "True":
+      # to allow iframe embedding. https://github.com/apache/incubator-superset/issues/8382
+      SESSION_COOKIE_SAMESITE = 'None'
+      SESSION_COOKIE_SECURE = True
+      SESSION_COOKIE_HTTPONLY = False
+
+      # Use all X-Forwarded headers when ENABLE_PROXY_FIX is True.
+      ENABLE_PROXY_FIX = True
+
+      # CSRF
+      WTF_CSRF_ENABLED = False
+
+      HTTP_HEADERS = {'X-Frame-Options': 'ALLOWALL'}
+
+    # https://github.com/komoot/superset-reverse-nginx-example/blob/master/superset_config.py
+    class ReverseProxied(object):
+      """
+      Because we are reverse proxied from an aws load balancer
+      use environ/config to signal https
+      since flask ignores preferred_url_scheme in url_for calls
+      """
+      def __init__(self, app):
+        self.app = app
+
+      def __call__(self, environ, start_response):
+        environ["wsgi.url_scheme"] = "https"
+        return self.app(environ, start_response)
+
+    # prevent redirect from https to http
+    ADDITIONAL_MIDDLEWARE = [ReverseProxied, ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superset
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: superset
+  template:
+    metadata:
+      labels:
+        app: superset
+    spec:
+      securityContext:
+        runAsUser: 1000
+      initContainers:
+      - name: superset-init
+        image: superset
+        command: [ "bash", "-c" ]
+        args:
+        - >-
+            echo "Step 1. Setting up admin user" &&
+            superset fab create-admin --username admin --firstname Superset --lastname Admin --email admin@superset.com --password admin &&
+            echo "Step 2. Applying DB migrations" &&
+            superset db upgrade &&
+            echo "Step 3. Loading examplese" &&
+            superset load_examples &&
+            echo "Step 4. Settting up roles and perms" &&
+            superset init
+        envFrom:
+          - configMapRef:
+              name: env
+        env:
+        - name: SUPERSET_CONFIG_PATH
+          value: /superset-config/superset_config.py
+        - name: ALLOW_IFRAME
+          value: "False"
+        volumeMounts:
+        - name: config-volume
+          mountPath: /superset-config
+      containers:
+      - name: superset
+        image: superset
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2048Mi"
+        envFrom:
+        - configMapRef:
+            name: env
+        env:
+        - name: SUPERSET_CONFIG_PATH
+          value: /superset-config/superset_config.py
+        - name: ALLOW_IFRAME
+          value: "False"
+        volumeMounts:
+        - name: config-volume
+          mountPath: /superset-config
+      volumes:
+      - name: config-volume
+        configMap:
+          name: superset-config
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: superset
+spec:
+  ports:
+  - port: 8088
+  selector:
+    app: superset
